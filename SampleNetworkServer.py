@@ -16,22 +16,21 @@ import string
 
 class SmartNetworkThermometer (threading.Thread) :
     open_cmds = ["AUTH", "LOGOUT"]
-    prot_cmds = ["SET_DEGF", "SET_DEGC", "SET_DEGK", "GET_TEMP", "UPDATE_TEMP"]
+    prot_cmds = ["SET_DEGF", "SET_DEGC", "SET_DEGK", "GET_TEMP", "UPDATE_TEMP", "GET_UNIT"]
 
     def __init__ (self, source, updatePeriod, port) :
         threading.Thread.__init__(self, daemon = True) 
-        #set daemon to be true, so it doesn't block program from exiting
         self.source = source
         self.updatePeriod = updatePeriod
         self.curTemperature = 0
         self.updateTemperature()
         self.tokens = []
+        self.deg = "K"  # Default unit is Kelvin
+        self.unit_lock = threading.Lock()  # Lock for thread-safe unit changes
 
         self.serverSocket = socket.socket(family=socket.AF_INET, type=socket.SOCK_DGRAM)
         self.serverSocket.bind(("127.0.0.1", port))
         fcntl.fcntl(self.serverSocket, fcntl.F_SETFL, os.O_NONBLOCK)
-
-        self.deg = "K"
 
     def setSource(self, source) :
         self.source = source
@@ -40,19 +39,20 @@ class SmartNetworkThermometer (threading.Thread) :
         self.updatePeriod = updatePeriod 
 
     def setDegreeUnit(self, s) :
-        self.deg = s
-        if self.deg not in ["F", "K", "C"] :
-            self.deg = "K"
+        with self.unit_lock:
+            self.deg = s
+            if self.deg not in ["F", "K", "C"] :
+                self.deg = "K"
+
+    def getDegreeUnit(self):
+        with self.unit_lock:
+            return self.deg
 
     def updateTemperature(self) :
         self.curTemperature = self.source.getTemperature()
 
     def getTemperature(self) :
-        if self.deg == "C" :
-            return self.curTemperature - 273
-        if self.deg == "F" :
-            return (self.curTemperature - 273) * 9 / 5 + 32
-
+        # Always return temperature in Kelvin; let client handle conversions
         return self.curTemperature
 
     def processCommands(self, msg, addr) :
@@ -64,7 +64,6 @@ class SmartNetworkThermometer (threading.Thread) :
                     if cs[1] == "!Q#E%T&U8i6y4r2w" :
                         self.tokens.append(''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(16)))
                         self.serverSocket.sendto(self.tokens[-1].encode("utf-8"), addr)
-                        #print (self.tokens[-1])
                     else:
                         self.serverSocket.sendto("Incorrect password".encode("utf-8"), addr)
                 elif cs[0] == "LOGOUT":
@@ -73,18 +72,19 @@ class SmartNetworkThermometer (threading.Thread) :
                 else : #unknown command
                     self.serverSocket.sendto(b"Invalid Command\n", addr)
             elif c == "SET_DEGF" :
-                self.deg = "F"
+                self.setDegreeUnit("F")
             elif c == "SET_DEGC" :
-                self.deg = "C"
+                self.setDegreeUnit("C")
             elif c == "SET_DEGK" :
-                self.deg = "K"
+                self.setDegreeUnit("K")
             elif c == "GET_TEMP" :
                 self.serverSocket.sendto(b"%f\n" % self.getTemperature(), addr)
             elif c == "UPDATE_TEMP" :
                 self.updateTemperature()
+            elif c == "GET_UNIT" :
+                self.serverSocket.sendto(self.getDegreeUnit().encode("utf-8"), addr)
             elif c :
                 self.serverSocket.sendto(b"Invalid Command\n", addr)
-
 
     def run(self) : #the running function
         while True : 
@@ -95,13 +95,12 @@ class SmartNetworkThermometer (threading.Thread) :
                 if len(cmds) == 1 : # protected commands case
                     semi = msg.find(';')
                     if semi != -1 : #if we found the semicolon
-                        #print (msg)
                         if msg[:semi] in self.tokens : #if its a valid token
                             self.processCommands(msg[semi+1:], addr)
                         else :
                             self.serverSocket.sendto(b"Bad Token\n", addr)
                     else :
-                            self.serverSocket.sendto(b"Bad Command\n", addr)
+                        self.serverSocket.sendto(b"Bad Command\n", addr)
                 elif len(cmds) == 2 :
                     if cmds[0] in self.open_cmds : #if its AUTH or LOGOUT
                         self.processCommands(msg, addr) 
@@ -113,14 +112,10 @@ class SmartNetworkThermometer (threading.Thread) :
     
             except IOError as e :
                 if e.errno == errno.EWOULDBLOCK :
-                    #do nothing
                     pass
                 else :
-                    #do nothing for now
                     pass
                 msg = ""
-
- 
 
             self.updateTemperature()
             time.sleep(self.updatePeriod)
@@ -137,66 +132,67 @@ class SimpleClient :
         self.infLn, = plt.plot(range(30), self.infTemps, label="Infant Temperature")
         self.incLn, = plt.plot(range(30), self.incTemps, label="Incubator Temperature")
         plt.xticks(range(30), self.times, rotation=45)
-        plt.ylim((20,50))
+        plt.ylim((20, 50))
+        plt.ylabel("Temperature (°C)")
         plt.legend(handles=[self.infLn, self.incLn])
         self.infTherm = therm1
         self.incTherm = therm2
+        self.temp_lock = threading.Lock()  # Lock for thread-safe temperature access
 
         self.ani = animation.FuncAnimation(self.fig, self.updateInfTemp, interval=500)
         self.ani2 = animation.FuncAnimation(self.fig, self.updateIncTemp, interval=500)
+
+    def convert_to_celsius(self, temp_k):
+        """Convert temperature from Kelvin to Celsius."""
+        return temp_k - 273
 
     def updateTime(self) :
         now = time.time()
         if math.floor(now) > math.floor(self.lastTime) :
             t = time.strftime("%H:%M:%S", time.localtime(now))
             self.times.append(t)
-            #last 30 seconds of of data
             self.times = self.times[-30:]
             self.lastTime = now
-            plt.xticks(range(30), self.times,rotation = 45)
+            plt.xticks(range(30), self.times, rotation=45)
             plt.title(time.strftime("%A, %Y-%m-%d", time.localtime(now)))
-
 
     def updateInfTemp(self, frame) :
         self.updateTime()
-        self.infTemps.append(self.infTherm.getTemperature()-273)
-        #self.infTemps.append(self.infTemps[-1] + 1)
-        self.infTemps = self.infTemps[-30:]
-        self.infLn.set_data(range(30), self.infTemps)
+        with self.temp_lock:
+            temp_k = self.infTherm.getTemperature()
+            self.infTemps.append(self.convert_to_celsius(temp_k))
+            self.infTemps = self.infTemps[-30:]
+            self.infLn.set_data(range(30), self.infTemps)
         return self.infLn,
 
     def updateIncTemp(self, frame) :
         self.updateTime()
-        self.incTemps.append(self.incTherm.getTemperature()-273)
-        #self.incTemps.append(self.incTemps[-1] + 1)
-        self.incTemps = self.incTemps[-30:]
-        self.incLn.set_data(range(30), self.incTemps)
+        with self.temp_lock:
+            temp_k = self.incTherm.getTemperature()
+            self.incTemps.append(self.convert_to_celsius(temp_k))
+            self.incTemps = self.incTemps[-30:]
+            self.incLn.set_data(range(30), self.incTemps)
         return self.incLn,
 
 UPDATE_PERIOD = .05 #in seconds
 SIMULATION_STEP = .1 #in seconds
 
-#create a new instance of IncubatorSimulator
 bob = infinc.Human(mass = 8, length = 1.68, temperature = 36 + 273)
-#bobThermo = infinc.SmartThermometer(bob, UPDATE_PERIOD)
 bobThermo = SmartNetworkThermometer(bob, UPDATE_PERIOD, 23456)
-bobThermo.start() #start the thread
+bobThermo.start()
 
 inc = infinc.Incubator(width = 1, depth=1, height = 1, temperature = 37 + 273, roomTemperature = 20 + 273)
-#incThermo = infinc.SmartNetworkThermometer(inc, UPDATE_PERIOD)
 incThermo = SmartNetworkThermometer(inc, UPDATE_PERIOD, 23457)
-incThermo.start() #start the thread
+incThermo.start()
 
 incHeater = infinc.SmartHeater(powerOutput = 1500, setTemperature = 45 + 273, thermometer = incThermo, updatePeriod = UPDATE_PERIOD)
 inc.setHeater(incHeater)
-incHeater.start() #start the thread
+incHeater.start()
 
 sim = infinc.Simulator(infant = bob, incubator = inc, roomTemp = 20 + 273, timeStep = SIMULATION_STEP, sleepTime = SIMULATION_STEP / 10)
-
 sim.start()
 
 sc = SimpleClient(bobThermo, incThermo)
 
 plt.grid()
 plt.show()
-
